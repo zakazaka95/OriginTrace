@@ -5,8 +5,8 @@ import hashlib
 import json
 
 
-CONTRACT_VERSION = "1.0.5"
-FETCH_ADAPTER = "origintrace-explicit-web-request-v4"
+CONTRACT_VERSION = "1.1.0"
+FETCH_ADAPTER = "origintrace-full-receipt-consensus-v5"
 MAX_FILES = 8
 MAX_LINKS = 12
 MAX_FINDINGS = 8
@@ -104,7 +104,7 @@ def _metadata_links(info: dict) -> list:
         value = str(value or "").strip()
         if value and value not in clean:
             clean.append(value[:500])
-    return clean[:MAX_LINKS]
+    return sorted(clean)[:MAX_LINKS]
 
 
 def _publisher_repositories(provenance: dict) -> list:
@@ -121,25 +121,24 @@ def _publisher_repositories(provenance: dict) -> list:
         repository = str(publisher.get("repository", "")).strip().lower()
         if repository and repository not in repositories:
             repositories.append(repository[:200])
-    return repositories
+    return sorted(repositories)
 
 
 def _fetch_evidence(package: str, version: str) -> dict:
     release_url = f"https://pypi.org/pypi/{package}/{version}/json"
     try:
         status, release = _origintrace_read_json(release_url)
-    except Exception as exc:
+    except Exception:
         return {
             "release_url": release_url,
             "release_status": 0,
-            "release_error": str(exc)[:300],
+            "release_error": "RELEASE_REQUEST_FAILED",
             "package": package,
             "version": version,
             "metadata_links": [],
             "files": [],
             "files_truncated": False,
         }
-
     if status != 200 or release is None:
         return {
             "release_url": release_url,
@@ -159,10 +158,12 @@ def _fetch_evidence(package: str, version: str) -> dict:
     if not isinstance(raw_files, list):
         raw_files = []
 
+    ordered_files = sorted(
+        [item for item in raw_files if isinstance(item, dict)],
+        key=lambda item: str(item.get("filename", "")),
+    )
     files = []
-    for item in raw_files[:MAX_FILES]:
-        if not isinstance(item, dict):
-            continue
+    for item in ordered_files[:MAX_FILES]:
         filename = str(item.get("filename", "")).strip()
         digests = item.get("digests", {})
         sha256 = str(digests.get("sha256", "")) if isinstance(digests, dict) else ""
@@ -200,7 +201,7 @@ def _fetch_evidence(package: str, version: str) -> dict:
             "provenance_url": provenance_url,
             "provenance_status": provenance_status,
             "provenance_state": provenance_state,
-            "publisher_repositories": repositories,
+            "publisher_repositories": sorted(repositories),
             "attestation_count": attestation_count,
         })
 
@@ -213,7 +214,7 @@ def _fetch_evidence(package: str, version: str) -> dict:
         "yanked": info.get("yanked") is True,
         "metadata_links": _metadata_links(info),
         "files": files,
-        "files_truncated": len(raw_files) > MAX_FILES,
+        "files_truncated": len(ordered_files) > MAX_FILES,
     }
 
 
@@ -233,11 +234,16 @@ def _facts(evidence: dict, expected_repository: str) -> dict:
             if repository and repository not in publisher_repositories:
                 publisher_repositories.append(repository)
 
-    conflicts = [
+    metadata_repositories = sorted(metadata_repositories)
+    publisher_repositories = sorted(publisher_repositories)
+    conflicts = sorted([
         repository for repository in publisher_repositories
         if repository != expected_repository
-    ]
+    ])
     expected_in_metadata = expected_repository in metadata_repositories
+    metadata_mismatch = (
+        len(metadata_repositories) > 0 and not expected_in_metadata
+    )
     complete = (
         len(states) > 0
         and all(state == "AVAILABLE" for state in states)
@@ -253,6 +259,7 @@ def _facts(evidence: dict, expected_repository: str) -> dict:
         "publisher_repositories": publisher_repositories,
         "conflicting_publishers": conflicts,
         "expected_in_metadata": expected_in_metadata,
+        "metadata_mismatch": metadata_mismatch,
         "complete_provenance": complete,
         "unreadable": unreadable,
         "file_count": len(states),
@@ -277,10 +284,7 @@ Decisions:
 - UNREADABLE: required PyPI metadata or provenance could not be read.
 
 Return only JSON:
-{{"decision":"VERIFIED|PROVENANCE_GAP|IDENTITY_MISMATCH|UNREADABLE",
-"observed_repository":"owner/repository or empty",
-"summary":"concise evidence-grounded explanation",
-"findings":["short finding"]}}
+{{"decision":"VERIFIED|PROVENANCE_GAP|IDENTITY_MISMATCH|UNREADABLE"}}
 
 DETERMINISTIC FACTS:
 {_canonical(facts)}
@@ -290,53 +294,117 @@ SOURCE SNAPSHOT:
 """
 
 
-def _normalize(raw, check: dict, evidence: dict, facts: dict) -> dict:
+def _required_decision(facts: dict) -> str:
+    if facts["unreadable"]:
+        return "UNREADABLE"
+    if facts["conflicting_publishers"] or facts["metadata_mismatch"]:
+        return "IDENTITY_MISMATCH"
+    if (
+        facts["complete_provenance"]
+        and facts["expected_in_metadata"]
+        and facts["expected_repository"] in facts["publisher_repositories"]
+    ):
+        return "VERIFIED"
+    return "PROVENANCE_GAP"
+
+
+def _normalize_decision(raw, facts: dict) -> str:
     if not isinstance(raw, dict):
         raise gl.UserError("Validator output must be a JSON object")
     decision = str(raw.get("decision", "")).strip().upper()
     if decision not in DECISIONS:
         raise gl.UserError("Validator returned an invalid decision")
+    required = _required_decision(facts)
+    if decision != required:
+        raise gl.UserError(
+            f"Evidence requires {required}, validator returned {decision}"
+        )
+    return decision
 
-    if facts["unreadable"] and decision != "UNREADABLE":
-        raise gl.UserError("Unreadable required evidence must remain UNREADABLE")
-    if facts["conflicting_publishers"] and decision != "IDENTITY_MISMATCH":
-        raise gl.UserError("Conflicting attested identity requires IDENTITY_MISMATCH")
-    if decision == "VERIFIED" and not (
-        facts["complete_provenance"]
-        and facts["expected_in_metadata"]
-        and not facts["conflicting_publishers"]
-        and check["expected_repository"] in facts["publisher_repositories"]
-    ):
-        raise gl.UserError("VERIFIED requires complete matching provenance")
 
-    summary = str(raw.get("summary", "")).strip()
-    if len(summary) < 20 or len(summary) > 1_000:
-        raise gl.UserError("Validator summary has an invalid length")
-    findings_raw = raw.get("findings", [])
+def _receipt_narrative(decision: str, evidence: dict, facts: dict) -> tuple:
+    expected = facts["expected_repository"]
+    file_count = int(facts["file_count"])
+    attested = int(facts["attested_file_count"])
     findings = []
-    if isinstance(findings_raw, list):
-        for finding in findings_raw[:MAX_FINDINGS]:
-            finding = str(finding).strip()[:300]
-            if finding:
-                findings.append(finding)
 
+    if decision == "VERIFIED":
+        summary = (
+            f"All {file_count} release files have PyPI provenance and every "
+            f"publisher repository matches {expected}."
+        )
+        findings = [
+            f"Release metadata identifies {expected}.",
+            f"{attested} of {file_count} release files have provenance.",
+            "No conflicting publisher repository was observed.",
+        ]
+    elif decision == "IDENTITY_MISMATCH":
+        mismatches = facts["conflicting_publishers"]
+        if not mismatches:
+            mismatches = facts["metadata_repositories"]
+        summary = (
+            f"Observed repository identity does not match the requested "
+            f"repository {expected}."
+        )
+        findings = [
+            f"Observed repository: {repository}"
+            for repository in mismatches
+        ]
+    elif decision == "PROVENANCE_GAP":
+        summary = (
+            "No conflicting publisher was confirmed, but the submitted release "
+            "does not have complete provenance coverage and repository linkage."
+        )
+        if not facts["expected_in_metadata"]:
+            findings.append("Release metadata does not identify the expected repository.")
+        if facts["missing_file_count"]:
+            findings.append(
+                f"{facts['missing_file_count']} release file(s) are missing provenance."
+            )
+        if evidence.get("files_truncated", False):
+            findings.append("The release contains more files than the inspection limit.")
+        if file_count == 0:
+            findings.append("No release files were present in readable metadata.")
+    else:
+        summary = "Required PyPI release or provenance evidence could not be read."
+        findings = [
+            f"Release endpoint status: {int(evidence.get('release_status', 0))}."
+        ]
+        error = str(evidence.get("release_error", "")).strip()
+        if error:
+            findings.append(error[:300])
+
+    return summary, findings[:MAX_FINDINGS]
+
+
+def _observed_repository(facts: dict) -> str:
+    expected = facts["expected_repository"]
+    publishers = facts["publisher_repositories"]
+    metadata = facts["metadata_repositories"]
+    if expected in publishers or expected in metadata:
+        return expected
+    candidates = facts["conflicting_publishers"] or publishers or metadata
+    return candidates[0] if candidates else ""
+
+
+def _build_receipt(
+    check: dict,
+    evidence: dict,
+    facts: dict,
+    decision: str,
+) -> dict:
+    summary, findings = _receipt_narrative(decision, evidence, facts)
     return {
         "check_id": check["id"],
         "request_hash": check["request_hash"],
         "source_snapshot_hash": _hash(_canonical(evidence)),
         "decision": decision,
         "expected_repository": check["expected_repository"],
-        "observed_repository": str(raw.get("observed_repository", "")).strip().lower()[:200],
+        "observed_repository": _observed_repository(facts),
         "summary": summary,
         "findings": findings,
-        "file_count": facts["file_count"],
-        "attested_file_count": facts["attested_file_count"],
-        "metadata_repositories": facts["metadata_repositories"],
-        "publisher_repositories": facts["publisher_repositories"],
-        "files": evidence.get("files", []),
-        "release_status": int(evidence.get("release_status", 0)),
-        "release_error": str(evidence.get("release_error", ""))[:300],
-        "files_truncated": bool(evidence.get("files_truncated", False)),
+        "facts": facts,
+        "evidence": evidence,
     }
 
 
@@ -401,16 +469,14 @@ class OriginTrace(gl.Contract):
             if facts["unreadable"]:
                 raw = {
                     "decision": "UNREADABLE",
-                    "observed_repository": "",
-                    "summary": "Required PyPI release or provenance evidence could not be read.",
-                    "findings": ["Retry is allowed because the failure may be temporary."],
                 }
             else:
                 raw = gl.nondet.exec_prompt(
                     _prompt(check, evidence, facts),
                     response_format="json",
                 )
-            return _normalize(raw, check, evidence, facts)
+            decision = _normalize_decision(raw, facts)
+            return _build_receipt(check, evidence, facts, decision)
 
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
@@ -422,27 +488,23 @@ class OriginTrace(gl.Contract):
                 if facts["unreadable"]:
                     independent_raw = {
                         "decision": "UNREADABLE",
-                        "observed_repository": "",
-                        "summary": "Required PyPI release or provenance evidence could not be read.",
-                        "findings": ["Retry is allowed because the failure may be temporary."],
                     }
                 else:
                     independent_raw = gl.nondet.exec_prompt(
                         _prompt(check, evidence, facts),
                         response_format="json",
                     )
-                independent = _normalize(independent_raw, check, evidence, facts)
-                return (
-                    candidate["check_id"] == check["id"]
-                    and candidate["request_hash"] == check["request_hash"]
-                    and candidate["decision"] == independent["decision"]
-                    and candidate["source_snapshot_hash"] == independent["source_snapshot_hash"]
-                    and candidate["expected_repository"] == independent["expected_repository"]
-                    and candidate["file_count"] == independent["file_count"]
-                    and candidate["attested_file_count"] == independent["attested_file_count"]
-                    and candidate["metadata_repositories"] == independent["metadata_repositories"]
-                    and candidate["publisher_repositories"] == independent["publisher_repositories"]
+                decision = _normalize_decision(independent_raw, facts)
+                independent = _build_receipt(
+                    check,
+                    evidence,
+                    facts,
+                    decision,
                 )
+                # Every leader-proposed evidence and verdict field is compared.
+                # This explicitly binds per-file digests, provenance URLs/statuses,
+                # release status, truncation, derived facts, verdict, and narrative.
+                return _canonical(candidate) == _canonical(independent)
             except Exception:
                 return False
 

@@ -1,6 +1,6 @@
 # OriginTrace
 
-OriginTrace is a GenLayer Intelligent Contract that creates an on-chain provenance receipt for a specific Python package release. The current source version is `1.0.5`.
+OriginTrace is a GenLayer Intelligent Contract that creates an on-chain provenance receipt for a specific Python package release. The current source version is `1.1.0`.
 
 A requester locks three facts: the PyPI package, the exact version, and the expected GitHub repository. Independent validators then read the live PyPI release metadata and the PyPI Integrity API for every release file. The contract records one narrow result:
 
@@ -13,7 +13,7 @@ A requester locks three facts: the PyPI package, the exact version, and the expe
 
 ## Why GenLayer
 
-The relevant evidence lives across changing public APIs and must be interpreted as one release identity. A leader proposes a normalized receipt. Validators independently refetch the same PyPI metadata and per-file provenance, reproduce the classification, and compare the decision plus the objective evidence snapshot. State changes only after consensus.
+The relevant evidence lives across changing public APIs and must be interpreted as one release identity. A leader proposes only the classification. The complete receipt is then built deterministically from the fetched evidence. Validators independently refetch the same PyPI metadata and every per-file provenance record, rebuild the receipt, and require exact canonical equality across the entire payload before state can change.
 
 ## Contract design
 
@@ -22,7 +22,8 @@ The relevant evidence lives across changing public APIs and must be interpreted 
 - Conflicting attested publisher identities deterministically require `IDENTITY_MISMATCH`.
 - Missing and temporarily unreadable evidence are distinct outcomes.
 - Retries are bounded and final decisions cannot be overwritten.
-- Accepted receipts include file hashes, provenance URLs, publisher repositories, and an evidence snapshot hash.
+- Accepted receipts include the complete normalized evidence and derived facts, including every file hash, provenance URL/status, release status, truncation flag, publisher repository, and evidence snapshot hash.
+- The validator compares the entire consequential receipt payload, so a leader cannot persist different evidence than validators fetched.
 
 ## Public methods
 
@@ -57,10 +58,10 @@ python -m unittest test_origintrace.py
 ## Deployment
 
 - Network: GenLayer Bradbury Testnet
-- Current v1.0.5 contract: `0x49bD8511b1746AeCA391C118cC72ABa274092714`
-- Explorer contract: https://explorer-bradbury.genlayer.com/address/0x49bD8511b1746AeCA391C118cC72ABa274092714
-- Studio import: https://studio.genlayer.com/?import-contract=0x49bD8511b1746AeCA391C118cC72ABa274092714
-- Verified evaluation: https://explorer-bradbury.genlayer.com/tx/0xaafd26b02bc7e5b11eeccaa0346fdd4cfaafa86cad90d0b2cce3eb57dbc6cfcb
+- Current v1.1.0 deployment: [`0xC977BF8Bb668fa6AC238e26B0c46109eaD5CEF18`](https://explorer-bradbury.genlayer.com/address/0xC977BF8Bb668fa6AC238e26B0c46109eaD5CEF18)
+- Deployment transaction: [`0x869e35...cf217`](https://explorer-bradbury.genlayer.com/tx/0x869e35cce40c23bedd0a75aac74dc18d7f5a131fcbad3f9660503e497dbcf217)
+- `VERIFIED` evaluation: [`0x62f428...7e1df`](https://explorer-bradbury.genlayer.com/tx/0x62f428cd121818ae804c4819234a483a9798b2a938b7ed105c381839fc97e1df)
+- Rejected v1.0.5 deployment: `0x49bD8511b1746AeCA391C118cC72ABa274092714` (do not resubmit)
 - Legacy diagnostic deployment: `0x0217CA3237650072a73548194eD886923d907bC1` (do not submit)
 
 The tracked `OriginTrace.py` file is the submitted source for the deployment.

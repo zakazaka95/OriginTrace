@@ -1,4 +1,5 @@
 import ast
+import copy
 import importlib.util
 import json
 import pathlib
@@ -71,10 +72,13 @@ class _Nondet:
 
 class _VM:
     Return = _Return
+    mutator = None
 
     @staticmethod
     def run_nondet_unsafe(leader_fn, validator_fn):
         candidate = leader_fn()
+        if _VM.mutator is not None:
+            candidate = _VM.mutator(copy.deepcopy(candidate))
         if not validator_fn(_Return(candidate)):
             raise AssertionError("Validator rejected the configured candidate")
         return candidate
@@ -159,6 +163,7 @@ class OriginTraceTests(unittest.TestCase):
         ot.gl.nondet.candidate = None
         ot.gl.nondet.validator_candidate = None
         ot.gl.nondet.calls = 0
+        _VM.mutator = None
         self.contract = ot.OriginTrace()
 
     def open(self):
@@ -179,9 +184,13 @@ class OriginTraceTests(unittest.TestCase):
         result = self.contract.evaluate_release(ot.u64(opened["id"]))
 
         self.assertEqual(result["status"], "VERIFIED")
-        self.assertEqual(result["receipt"]["attested_file_count"], 2)
+        self.assertEqual(result["receipt"]["facts"]["attested_file_count"], 2)
         self.assertEqual(result["receipt"]["expected_repository"], REPOSITORY)
-        self.assertEqual(result["receipt"]["release_status"], 200)
+        self.assertEqual(result["receipt"]["evidence"]["release_status"], 200)
+        self.assertEqual(
+            result["receipt"]["source_snapshot_hash"],
+            ot._hash(ot._canonical(result["receipt"]["evidence"])),
+        )
         self.assertEqual(self.contract.get_stats()["verified"], 1)
 
     def test_missing_file_provenance_becomes_gap(self):
@@ -191,7 +200,7 @@ class OriginTraceTests(unittest.TestCase):
         result = self.contract.evaluate_release(ot.u64(1))
 
         self.assertEqual(result["status"], "PROVENANCE_GAP")
-        self.assertEqual(result["receipt"]["attested_file_count"], 1)
+        self.assertEqual(result["receipt"]["facts"]["attested_file_count"], 1)
 
     def test_conflicting_attested_repository_requires_mismatch(self):
         self.open()
@@ -221,6 +230,131 @@ class OriginTraceTests(unittest.TestCase):
         ot.gl.nondet.validator_candidate = self.candidate("PROVENANCE_GAP")
         with self.assertRaises(AssertionError):
             self.contract.evaluate_release(ot.u64(1))
+
+    def test_validator_rejects_tampered_file_digest(self):
+        self.open()
+        ot.gl.nondet.candidate = self.candidate("VERIFIED")
+
+        def tamper(receipt):
+            receipt["evidence"]["files"][0]["sha256"] = "0" * 64
+            return receipt
+
+        _VM.mutator = tamper
+        with self.assertRaises(AssertionError):
+            self.contract.evaluate_release(ot.u64(1))
+
+    def test_validator_rejects_tampered_provenance_url(self):
+        self.open()
+        ot.gl.nondet.candidate = self.candidate("VERIFIED")
+
+        def tamper(receipt):
+            receipt["evidence"]["files"][0]["provenance_url"] = (
+                "https://example.invalid/forged-provenance"
+            )
+            return receipt
+
+        _VM.mutator = tamper
+        with self.assertRaises(AssertionError):
+            self.contract.evaluate_release(ot.u64(1))
+
+    def test_validator_rejects_tampered_provenance_status(self):
+        self.open()
+        ot.gl.nondet.candidate = self.candidate("VERIFIED")
+
+        def tamper(receipt):
+            receipt["evidence"]["files"][0]["provenance_status"] = 404
+            receipt["source_snapshot_hash"] = ot._hash(
+                ot._canonical(receipt["evidence"])
+            )
+            return receipt
+
+        _VM.mutator = tamper
+        with self.assertRaises(AssertionError):
+            self.contract.evaluate_release(ot.u64(1))
+
+    def test_validator_rejects_tampered_release_and_truncation_fields(self):
+        self.open()
+        ot.gl.nondet.candidate = self.candidate("VERIFIED")
+
+        def tamper(receipt):
+            receipt["evidence"]["release_status"] = 201
+            receipt["evidence"]["files_truncated"] = True
+            return receipt
+
+        _VM.mutator = tamper
+        with self.assertRaises(AssertionError):
+            self.contract.evaluate_release(ot.u64(1))
+
+    def test_validator_rejects_tampered_derived_counts(self):
+        self.open()
+        ot.gl.nondet.candidate = self.candidate("VERIFIED")
+
+        def tamper(receipt):
+            receipt["facts"]["attested_file_count"] = 99
+            return receipt
+
+        _VM.mutator = tamper
+        with self.assertRaises(AssertionError):
+            self.contract.evaluate_release(ot.u64(1))
+
+    def test_validator_rejects_tampered_narrative(self):
+        self.open()
+        ot.gl.nondet.candidate = self.candidate("VERIFIED")
+
+        def tamper(receipt):
+            receipt["summary"] = "A leader-authored summary that validators did not produce."
+            receipt["findings"] = ["Forged finding"]
+            return receipt
+
+        _VM.mutator = tamper
+        with self.assertRaises(AssertionError):
+            self.contract.evaluate_release(ot.u64(1))
+
+    def test_file_limit_forces_gap_and_is_recorded(self):
+        self.open()
+        payload = release()
+        payload["urls"] = []
+        for index in range(9):
+            filename = f"sampleproject-4.0.0-{index}.whl"
+            payload["urls"].append({
+                "filename": filename,
+                "digests": {"sha256": str(index) * 64},
+                "packagetype": "bdist_wheel",
+                "upload_time_iso_8601": "2024-11-06T22:37:09Z",
+                "yanked": False,
+            })
+            ot.gl.nondet.web.pages[provenance_url(filename)] = (
+                200,
+                provenance(),
+            )
+        ot.gl.nondet.web.pages[RELEASE_URL] = (200, payload)
+        ot.gl.nondet.candidate = self.candidate("PROVENANCE_GAP")
+
+        result = self.contract.evaluate_release(ot.u64(1))
+        self.assertEqual(result["status"], "PROVENANCE_GAP")
+        self.assertEqual(result["receipt"]["facts"]["file_count"], 8)
+        self.assertTrue(result["receipt"]["evidence"]["files_truncated"])
+
+    def test_source_order_does_not_change_canonical_evidence(self):
+        first = ot._fetch_evidence(PACKAGE, VERSION)
+        reversed_release = release()
+        reversed_release["info"]["project_urls"] = {
+            "Z source": f"https://github.com/{REPOSITORY}",
+            "A docs": "https://example.com/docs",
+        }
+        ot.gl.nondet.web.pages[RELEASE_URL] = (200, reversed_release)
+        second = ot._fetch_evidence(PACKAGE, VERSION)
+
+        reordered = copy.deepcopy(reversed_release)
+        reordered["urls"].reverse()
+        reordered["info"]["project_urls"] = {
+            "A docs": "https://example.com/docs",
+            "Z source": f"https://github.com/{REPOSITORY}",
+        }
+        ot.gl.nondet.web.pages[RELEASE_URL] = (200, reordered)
+        third = ot._fetch_evidence(PACKAGE, VERSION)
+        self.assertEqual(ot._canonical(second), ot._canonical(third))
+        self.assertNotEqual(ot._canonical(first), ot._canonical(second))
 
     def test_namespaced_json_reader_has_no_legacy_collision_or_headers(self):
         source = pathlib.Path(__file__).with_name("OriginTrace.py").read_text(
